@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 :FindPythonCommand
 for %%A in (python3 python) do (
-    where.exe /Q %%A
+    where /Q %%A
     if !errorlevel! EQU 0 (
         set "PYTHON_CMD=%%A"
         goto :Found
