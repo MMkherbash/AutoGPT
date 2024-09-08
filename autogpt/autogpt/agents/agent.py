@@ -100,7 +100,9 @@ class Agent(BaseAgent[OneShotAgentActionProposal], Configurable[AgentSettings]):
         super().__init__(settings)
 
         self.llm_provider = llm_provider
-        prompt_config = OneShotAgentPromptStrategy.default_configuration.copy(deep=True)
+        prompt_config = OneShotAgentPromptStrategy.default_configuration.model_copy(
+            deep=True
+        )
         prompt_config.use_functions_api = (
             settings.config.use_functions_api
             # Anthropic currently doesn't support tools + prefilling :(
@@ -117,7 +119,7 @@ class Agent(BaseAgent[OneShotAgentActionProposal], Configurable[AgentSettings]):
                 lambda x: self.llm_provider.count_tokens(x, self.llm.name),
                 llm_provider,
                 ActionHistoryConfiguration(
-                    model_name=app_config.fast_llm, max_tokens=self.send_token_limit
+                    llm_name=app_config.fast_llm, max_tokens=self.send_token_limit
                 ),
             )
             .run_after(WatchdogComponent)
@@ -160,7 +162,7 @@ class Agent(BaseAgent[OneShotAgentActionProposal], Configurable[AgentSettings]):
         constraints = await self.run_pipeline(DirectiveProvider.get_constraints)
         best_practices = await self.run_pipeline(DirectiveProvider.get_best_practices)
 
-        directives = self.state.directives.copy(deep=True)
+        directives = self.state.directives.model_copy(deep=True)
         directives.resources += resources
         directives.constraints += constraints
         directives.best_practices += best_practices
@@ -172,13 +174,19 @@ class Agent(BaseAgent[OneShotAgentActionProposal], Configurable[AgentSettings]):
         # Get messages
         messages = await self.run_pipeline(MessageProvider.get_messages)
 
+        include_os_info = (
+            self.code_executor.config.execute_local_commands
+            if hasattr(self, "code_executor")
+            else False
+        )
+
         prompt: ChatPrompt = self.prompt_strategy.build_prompt(
             messages=messages,
             task=self.state.task,
             ai_profile=self.state.ai_profile,
             ai_directives=directives,
             commands=function_specs_from_commands(self.commands),
-            include_os_info=self.code_executor.config.execute_local_commands,
+            include_os_info=include_os_info,
         )
 
         logger.debug(f"Executing prompt:\n{dump_prompt(prompt)}")

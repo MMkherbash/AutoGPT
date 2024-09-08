@@ -5,6 +5,13 @@ docs_dir: content
 nav:
   - Home: index.md
 
+  - The AutoGPT Server 🆕: 
+    - Build your own Blocks: server/new_blocks.md
+    - Setup: server/setup.md
+    - Advanced Setup: server/advanced_setup.md
+    - Using Ollama: server/ollama.md
+    - Using D-ID: serveer/d_id.md
+
   - AutoGPT Agent:
       - Introduction: AutoGPT/index.md
       - Setup:
@@ -40,7 +47,7 @@ nav:
       - Readme: https://github.com/Significant-Gravitas/AutoGPT/blob/master/frontend/README.md
 
   - Docs: docs/index.md
-
+    
   # - Challenges:
   #     - Introduction: challenges/introduction.md
   #     - List of Challenges:

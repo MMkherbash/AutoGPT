@@ -1,150 +1,546 @@
 import asyncio
-import json
+import logging
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
+import prisma.types
 from prisma.models import AgentGraph, AgentNode, AgentNodeLink
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
+from pydantic_core import PydanticUndefinedType
 
-from autogpt_server.data.db import BaseDbModel
+from autogpt_server.blocks.basic import InputBlock, OutputBlock
+from autogpt_server.data.block import BlockInput, get_block, get_blocks
+from autogpt_server.data.db import BaseDbModel, transaction
+from autogpt_server.data.user import DEFAULT_USER_ID
+from autogpt_server.util import json
+
+logger = logging.getLogger(__name__)
 
 
-class Link(BaseModel):
-    name: str
+class InputSchemaItem(BaseModel):
     node_id: str
-    
-    def __init__(self, name: str, node_id: str):
-        super().__init__(name=name, node_id=node_id)
-        
-    def __iter__(self):
-        return iter((self.name, self.node_id))
+    description: str | None = None
+    title: str | None = None
+
+
+class Link(BaseDbModel):
+    source_id: str
+    sink_id: str
+    source_name: str
+    sink_name: str
+    is_static: bool = False
+
+    @staticmethod
+    def from_db(link: AgentNodeLink):
+        return Link(
+            id=link.id,
+            source_name=link.sourceName,
+            source_id=link.agentNodeSourceId,
+            sink_name=link.sinkName,
+            sink_id=link.agentNodeSinkId,
+            is_static=link.isStatic,
+        )
+
+    def __hash__(self):
+        return hash((self.source_id, self.sink_id, self.source_name, self.sink_name))
 
 
 class Node(BaseDbModel):
     block_id: str
-    input_default: dict[str, Any] = {}  # dict[input_name, default_value]
-    input_nodes: list[Link] = []  # dict[input_name, node_id]
-    output_nodes: list[Link] = []  # dict[output_name, node_id]
+    input_default: BlockInput = {}  # dict[input_name, default_value]
     metadata: dict[str, Any] = {}
+
+    _input_links: list[Link] = PrivateAttr(default=[])
+    _output_links: list[Link] = PrivateAttr(default=[])
+
+    @property
+    def input_links(self) -> list[Link]:
+        return self._input_links
+
+    @property
+    def output_links(self) -> list[Link]:
+        return self._output_links
 
     @staticmethod
     def from_db(node: AgentNode):
         if not node.AgentBlock:
             raise ValueError(f"Invalid node {node.id}, invalid AgentBlock.")
-
-        return Node(
+        obj = Node(
             id=node.id,
             block_id=node.AgentBlock.id,
             input_default=json.loads(node.constantInput),
-            input_nodes=[
-                Link(v.sinkName, v.agentNodeSourceId)
-                for v in node.Input or []
-            ],
-            output_nodes=[
-                Link(v.sourceName, v.agentNodeSinkId)
-                for v in node.Output or []
-            ],
             metadata=json.loads(node.metadata),
         )
+        obj._input_links = [Link.from_db(link) for link in node.Input or []]
+        obj._output_links = [Link.from_db(link) for link in node.Output or []]
+        return obj
 
-    def connect(self, node: "Node", source_name: str, sink_name: str):
-        self.output_nodes.append(Link(source_name, node.id))
-        node.input_nodes.append(Link(sink_name, self.id))
 
+class GraphMeta(BaseDbModel):
+    version: int = 1
+    is_active: bool = True
+    is_template: bool = False
 
-class Graph(BaseDbModel):
     name: str
     description: str
-    nodes: list[Node]
-
-    @property
-    def starting_nodes(self) -> list[Node]:
-        return [node for node in self.nodes if not node.input_nodes]
 
     @staticmethod
     def from_db(graph: AgentGraph):
-        return Graph(
+        return GraphMeta(
             id=graph.id,
+            version=graph.version,
+            is_active=graph.isActive,
+            is_template=graph.isTemplate,
             name=graph.name or "",
             description=graph.description or "",
-            nodes=[Node.from_db(node) for node in graph.AgentNodes or []],
         )
 
 
-EXECUTION_NODE_INCLUDE = {
+class Graph(GraphMeta):
+    nodes: list[Node]
+    links: list[Link]
+    subgraphs: dict[str, list[str]] = {}  # subgraph_id -> [node_id]
+
+    @property
+    def starting_nodes(self) -> list[Node]:
+        outbound_nodes = {link.sink_id for link in self.links}
+        input_nodes = {
+            v.id for v in self.nodes if isinstance(get_block(v.block_id), InputBlock)
+        }
+        return [
+            node
+            for node in self.nodes
+            if node.id not in outbound_nodes or node.id in input_nodes
+        ]
+
+    @property
+    def ending_nodes(self) -> list[Node]:
+        return [v for v in self.nodes if isinstance(get_block(v.block_id), OutputBlock)]
+
+    @property
+    def subgraph_map(self) -> dict[str, str]:
+        """
+        Returns a mapping of node_id to subgraph_id.
+        A node in the main graph will be mapped to the graph's id.
+        """
+        subgraph_map = {
+            node_id: subgraph_id
+            for subgraph_id, node_ids in self.subgraphs.items()
+            for node_id in node_ids
+        }
+        subgraph_map.update(
+            {node.id: self.id for node in self.nodes if node.id not in subgraph_map}
+        )
+        return subgraph_map
+
+    def reassign_ids(self, reassign_graph_id: bool = False):
+        """
+        Reassigns all IDs in the graph to new UUIDs.
+        This method can be used before storing a new graph to the database.
+        """
+        self.validate_graph()
+
+        id_map = {
+            **{node.id: str(uuid.uuid4()) for node in self.nodes},
+            **{subgraph_id: str(uuid.uuid4()) for subgraph_id in self.subgraphs},
+        }
+
+        if reassign_graph_id:
+            self.id = str(uuid.uuid4())
+
+        for node in self.nodes:
+            node.id = id_map[node.id]
+
+        for link in self.links:
+            link.source_id = id_map[link.source_id]
+            link.sink_id = id_map[link.sink_id]
+
+        self.subgraphs = {
+            id_map[subgraph_id]: [id_map[node_id] for node_id in node_ids]
+            for subgraph_id, node_ids in self.subgraphs.items()
+        }
+
+    def validate_graph(self, for_run: bool = False):
+        def sanitize(name):
+            return name.split("_#_")[0].split("_@_")[0].split("_$_")[0]
+
+        # Nodes: required fields are filled or connected, except for InputBlock.
+        for node in self.nodes:
+            block = get_block(node.block_id)
+            if block is None:
+                raise ValueError(f"Invalid block {node.block_id} for node #{node.id}")
+
+            if not for_run:
+                continue  # Skip input completion validation, unless when executing.
+
+            provided_inputs = set(
+                [sanitize(name) for name in node.input_default]
+                + [sanitize(link.sink_name) for link in node.input_links]
+            )
+            for name in block.input_schema.get_required_fields():
+                if name not in provided_inputs and not isinstance(block, InputBlock):
+                    raise ValueError(
+                        f"Node {block.name} #{node.id} required input missing: `{name}`"
+                    )
+        node_map = {v.id: v for v in self.nodes}
+
+        def is_static_output_block(nid: str) -> bool:
+            bid = node_map[nid].block_id
+            b = get_block(bid)
+            return b.static_output if b else False
+
+        def is_input_output_block(nid: str) -> bool:
+            bid = node_map[nid].block_id
+            b = get_block(bid)
+            return isinstance(b, InputBlock) or isinstance(b, OutputBlock)
+
+        # subgraphs: all nodes in subgraph must be present in the graph.
+        for subgraph_id, node_ids in self.subgraphs.items():
+            for node_id in node_ids:
+                if node_id not in node_map:
+                    raise ValueError(f"Subgraph {subgraph_id}'s node {node_id} invalid")
+        subgraph_map = self.subgraph_map
+
+        # Links: links are connected and the connected pin data type are compatible.
+        for link in self.links:
+            source = (link.source_id, link.source_name)
+            sink = (link.sink_id, link.sink_name)
+            suffix = f"Link {source} <-> {sink}"
+
+            for i, (node_id, name) in enumerate([source, sink]):
+                node = node_map.get(node_id)
+                if not node:
+                    raise ValueError(
+                        f"{suffix}, {node_id} is invalid node id, available nodes: {node_map.keys()}"
+                    )
+
+                block = get_block(node.block_id)
+                if not block:
+                    blocks = {v.id: v.name for v in get_blocks().values()}
+                    raise ValueError(
+                        f"{suffix}, {node.block_id} is invalid block id, available blocks: {blocks}"
+                    )
+
+                sanitized_name = sanitize(name)
+                if i == 0:
+                    fields = f"Valid output fields: {block.output_schema.get_fields()}"
+                else:
+                    fields = f"Valid input fields: {block.input_schema.get_fields()}"
+                if sanitized_name not in fields:
+                    raise ValueError(f"{suffix}, `{name}` invalid, {fields}")
+
+            if (
+                subgraph_map.get(link.source_id) != subgraph_map.get(link.sink_id)
+                and not is_input_output_block(link.source_id)
+                and not is_input_output_block(link.sink_id)
+            ):
+                raise ValueError(f"{suffix}, Connecting nodes from different subgraph.")
+
+            if is_static_output_block(link.source_id):
+                link.is_static = True  # Each value block output should be static.
+
+            # TODO: Add type compatibility check here.
+
+    def get_input_schema(self) -> list[InputSchemaItem]:
+        """
+        Walks the graph and returns all the inputs that are either not:
+        - static
+        - provided by parent node
+        """
+        input_schema = []
+        for node in self.nodes:
+            block = get_block(node.block_id)
+            if not block:
+                continue
+
+            for input_name, input_schema_item in (
+                block.input_schema.jsonschema().get("properties", {}).items()
+            ):
+                # Check if the input is not static and not provided by a parent node
+                if (
+                    input_name not in node.input_default
+                    and not any(
+                        link.sink_name == input_name for link in node.input_links
+                    )
+                    and isinstance(
+                        block.input_schema.model_fields.get(input_name).default,
+                        PydanticUndefinedType,
+                    )
+                ):
+
+                    input_schema.append(
+                        InputSchemaItem(
+                            node_id=node.id,
+                            description=input_schema_item.get("description"),
+                            title=input_schema_item.get("title"),
+                        )
+                    )
+
+        return input_schema
+
+    @staticmethod
+    def from_db(graph: AgentGraph):
+        nodes = [
+            *(graph.AgentNodes or []),
+            *(
+                node
+                for subgraph in graph.AgentSubGraphs or []
+                for node in subgraph.AgentNodes or []
+            ),
+        ]
+        return Graph(
+            **GraphMeta.from_db(graph).model_dump(),
+            nodes=[Node.from_db(node) for node in nodes],
+            links=list(
+                {
+                    Link.from_db(link)
+                    for node in nodes
+                    for link in (node.Input or []) + (node.Output or [])
+                }
+            ),
+            subgraphs={
+                subgraph.id: [node.id for node in subgraph.AgentNodes or []]
+                for subgraph in graph.AgentSubGraphs or []
+            },
+        )
+
+
+AGENT_NODE_INCLUDE: prisma.types.AgentNodeInclude = {
     "Input": True,
     "Output": True,
     "AgentBlock": True,
+}
+
+__SUBGRAPH_INCLUDE = {"AgentNodes": {"include": AGENT_NODE_INCLUDE}}
+
+AGENT_GRAPH_INCLUDE: prisma.types.AgentGraphInclude = {
+    **__SUBGRAPH_INCLUDE,
+    "AgentSubGraphs": {"include": __SUBGRAPH_INCLUDE},  # type: ignore
 }
 
 
 # --------------------- Model functions --------------------- #
 
 
-async def get_node(node_id: str) -> Node | None:
+async def get_node(node_id: str) -> Node:
     node = await AgentNode.prisma().find_unique_or_raise(
         where={"id": node_id},
-        include=EXECUTION_NODE_INCLUDE,  # type: ignore
+        include=AGENT_NODE_INCLUDE,
     )
-    return Node.from_db(node) if node else None
+    return Node.from_db(node)
 
 
-async def get_graph_ids() -> list[str]:
-    return [graph.id for graph in await AgentGraph.prisma().find_many()]  # type: ignore
+async def get_graphs_meta(
+    filter_by: Literal["active", "template"] | None = "active",
+    user_id: str | None = None,
+) -> list[GraphMeta]:
+    """
+    Retrieves graph metadata objects.
+    Default behaviour is to get all currently active graphs.
+
+    Args:
+        filter_by: An optional filter to either select templates or active graphs.
+
+    Returns:
+        list[GraphMeta]: A list of objects representing the retrieved graph metadata.
+    """
+    where_clause: prisma.types.AgentGraphWhereInput = {}
+
+    if filter_by == "active":
+        where_clause["isActive"] = True
+    elif filter_by == "template":
+        where_clause["isTemplate"] = True
+
+    if user_id and filter_by != "template":
+        where_clause["userId"] = user_id
+
+    graphs = await AgentGraph.prisma().find_many(
+        where=where_clause,
+        distinct=["id"],
+        order={"version": "desc"},
+    )
+
+    if not graphs:
+        return []
+
+    return [GraphMeta.from_db(graph) for graph in graphs]
 
 
-async def get_graph(graph_id: str) -> Graph | None:
-    graph = await AgentGraph.prisma().find_unique(
-        where={"id": graph_id},
-        include={"AgentNodes": {"include": EXECUTION_NODE_INCLUDE}},  # type: ignore
+async def get_graph(
+    graph_id: str,
+    version: int | None = None,
+    template: bool = False,
+    user_id: str | None = None,
+) -> Graph | None:
+    """
+    Retrieves a graph from the DB.
+    Defaults to the version with `is_active` if `version` is not passed,
+    or the latest version with `is_template` if `template=True`.
+
+    Returns `None` if the record is not found.
+    """
+    where_clause: prisma.types.AgentGraphWhereInput = {
+        "id": graph_id,
+        "isTemplate": template,
+    }
+    if version is not None:
+        where_clause["version"] = version
+    elif not template:
+        where_clause["isActive"] = True
+
+    if user_id and not template:
+        where_clause["userId"] = user_id
+
+    graph = await AgentGraph.prisma().find_first(
+        where=where_clause,
+        include=AGENT_GRAPH_INCLUDE,
+        order={"version": "desc"},
     )
     return Graph.from_db(graph) if graph else None
 
 
-async def create_graph(graph: Graph) -> Graph:
-    await AgentGraph.prisma().create(
+async def set_graph_active_version(graph_id: str, version: int, user_id: str) -> None:
+    # Check if the graph belongs to the user
+    graph = await AgentGraph.prisma().find_first(
+        where={
+            "id": graph_id,
+            "version": version,
+            "userId": user_id,
+        }
+    )
+    if not graph:
+        raise Exception(f"Graph #{graph_id} v{version} not found or not owned by user")
+
+    updated_graph = await AgentGraph.prisma().update(
+        data={"isActive": True},
+        where={
+            "graphVersionId": {"id": graph_id, "version": version},
+        },
+    )
+    if not updated_graph:
+        raise Exception(f"Graph #{graph_id} v{version} not found")
+
+    # Deactivate all other versions
+    await AgentGraph.prisma().update_many(
+        data={"isActive": False},
+        where={"id": graph_id, "version": {"not": version}, "userId": user_id},
+    )
+
+
+async def get_graph_all_versions(graph_id: str, user_id: str) -> list[Graph]:
+    graph_versions = await AgentGraph.prisma().find_many(
+        where={"id": graph_id, "userId": user_id},
+        order={"version": "desc"},
+        include=AGENT_GRAPH_INCLUDE,
+    )
+
+    if not graph_versions:
+        return []
+
+    return [Graph.from_db(graph) for graph in graph_versions]
+
+
+async def create_graph(graph: Graph, user_id: str) -> Graph:
+    async with transaction() as tx:
+        await __create_graph(tx, graph, user_id)
+
+    if created_graph := await get_graph(
+        graph.id, graph.version, graph.is_template, user_id=user_id
+    ):
+        return created_graph
+
+    raise ValueError(f"Created graph {graph.id} v{graph.version} is not in DB")
+
+
+async def __create_graph(tx, graph: Graph, user_id: str):
+    await AgentGraph.prisma(tx).create(
         data={
             "id": graph.id,
+            "version": graph.version,
             "name": graph.name,
             "description": graph.description,
+            "isTemplate": graph.is_template,
+            "isActive": graph.is_active,
+            "userId": user_id,
         }
     )
 
-    # TODO: replace bulk creation using create_many
-    await asyncio.gather(*[
-        AgentNode.prisma().create({
-            "id": node.id,
-            "agentBlockId": node.block_id,
-            "agentGraphId": graph.id,
-            "constantInput": json.dumps(node.input_default),
-            "metadata": json.dumps(node.metadata),
-        }) for node in graph.nodes
-    ])
+    await asyncio.gather(
+        *[
+            AgentGraph.prisma(tx).create(
+                data={
+                    "id": subgraph_id,
+                    "agentGraphParentId": graph.id,
+                    "version": graph.version,
+                    "name": f"SubGraph of {graph.name}",
+                    "description": f"Sub-Graph of {graph.id}",
+                    "isTemplate": graph.is_template,
+                    "isActive": graph.is_active,
+                    "userId": user_id,
+                }
+            )
+            for subgraph_id in graph.subgraphs
+        ]
+    )
 
-    edge_source_names = {
-        (source_node.id, sink_node_id): output_name
-        for source_node in graph.nodes
-        for output_name, sink_node_id in source_node.output_nodes
-    }
-    edge_sink_names = {
-        (source_node_id, sink_node.id): input_name
-        for sink_node in graph.nodes
-        for input_name, source_node_id in sink_node.input_nodes
-    }
+    subgraph_map = graph.subgraph_map
 
-    # TODO: replace bulk creation using create_many
-    await asyncio.gather(*[
-        AgentNodeLink.prisma().create({
-            "id": str(uuid.uuid4()),
-            "sourceName": edge_source_names.get((input_node, output_node), ""),
-            "sinkName": edge_sink_names.get((input_node, output_node), ""),
-            "agentNodeSourceId": input_node,
-            "agentNodeSinkId": output_node,
-        })
-        for input_node, output_node in edge_source_names.keys() | edge_sink_names.keys()
-    ])
+    await asyncio.gather(
+        *[
+            AgentNode.prisma(tx).create(
+                {
+                    "id": node.id,
+                    "agentBlockId": node.block_id,
+                    "agentGraphId": subgraph_map.get(node.id, graph.id),
+                    "agentGraphVersion": graph.version,
+                    "constantInput": json.dumps(node.input_default),
+                    "metadata": json.dumps(node.metadata),
+                }
+            )
+            for node in graph.nodes
+        ]
+    )
 
-    if created_graph := await get_graph(graph.id):
-        return created_graph
+    await asyncio.gather(
+        *[
+            AgentNodeLink.prisma(tx).create(
+                {
+                    "id": str(uuid.uuid4()),
+                    "sourceName": link.source_name,
+                    "sinkName": link.sink_name,
+                    "agentNodeSourceId": link.source_id,
+                    "agentNodeSinkId": link.sink_id,
+                    "isStatic": link.is_static,
+                }
+            )
+            for link in graph.links
+        ]
+    )
 
-    raise ValueError(f"Failed to create graph {graph.id}.")
+
+# --------------------- Helper functions --------------------- #
+
+
+TEMPLATES_DIR = Path(__file__).parent.parent.parent / "graph_templates"
+
+
+async def import_packaged_templates() -> None:
+    templates_in_db = await get_graphs_meta(filter_by="template")
+
+    logging.info("Loading templates...")
+    for template_file in TEMPLATES_DIR.glob("*.json"):
+        template_data = json.loads(template_file.read_bytes())
+
+        template = Graph.model_validate(template_data)
+        if not template.is_template:
+            logging.warning(
+                f"pre-packaged graph file {template_file} is not a template"
+            )
+            continue
+        if (
+            exists := next((t for t in templates_in_db if t.id == template.id), None)
+        ) and exists.version >= template.version:
+            continue
+        await create_graph(template, DEFAULT_USER_ID)
+        logging.info(f"Loaded template '{template.name}' ({template.id})")

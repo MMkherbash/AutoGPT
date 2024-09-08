@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Any, Dict, Generic, Set, Tuple, Type, TypeVar
+
 from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import (
     BaseSettings,
@@ -22,7 +23,6 @@ class UpdateTrackingModel(BaseModel, Generic[T]):
             self._updated_fields.add(name)
         super().__setattr__(name, value)
 
-
     def mark_updated(self, field_name: str) -> None:
         if field_name in self.model_fields:
             self._updated_fields.add(field_name)
@@ -33,12 +33,33 @@ class UpdateTrackingModel(BaseModel, Generic[T]):
     def get_updates(self) -> Dict[str, Any]:
         return {field: getattr(self, field) for field in self._updated_fields}
 
+    @property
+    def updated_fields(self):
+        return self._updated_fields
+
 
 class Config(UpdateTrackingModel["Config"], BaseSettings):
     """Config for the server."""
 
-    num_workers: int = Field(
-        default=9, ge=1, le=100, description="Number of workers to use for execution."
+    num_graph_workers: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        description="Maximum number of workers to use for graph execution.",
+    )
+    num_node_workers: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        description="Maximum number of workers to use for node execution within a single graph.",
+    )
+    pyro_host: str = Field(
+        default="localhost",
+        description="The default hostname of the Pyro server.",
+    )
+    enable_auth: str = Field(
+        default="false",
+        description="If authentication is enabled or not",
     )
     # Add more configuration fields as needed
 
@@ -48,7 +69,6 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
             get_config_path() / "config.json",
         ],
         env_file=".env",
-        env_file_encoding="utf-8",
         extra="allow",
     )
 
@@ -61,13 +81,44 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> Tuple[PydanticBaseSettingsSource, ...]:
-        return (JsonConfigSettingsSource(settings_cls),)
+        return (
+            env_settings,
+            file_secret_settings,
+            dotenv_settings,
+            JsonConfigSettingsSource(settings_cls),
+            init_settings,
+        )
 
 
 class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
     """Secrets for the server."""
 
-    database_password: str = ""
+    openai_api_key: str = Field(default="", description="OpenAI API key")
+    anthropic_api_key: str = Field(default="", description="Anthropic API key")
+    groq_api_key: str = Field(default="", description="Groq API key")
+
+    reddit_client_id: str = Field(default="", description="Reddit client ID")
+    reddit_client_secret: str = Field(default="", description="Reddit client secret")
+    reddit_username: str = Field(default="", description="Reddit username")
+    reddit_password: str = Field(default="", description="Reddit password")
+
+    openweathermap_api_key: str = Field(
+        default="", description="OpenWeatherMap API key"
+    )
+
+    medium_api_key: str = Field(default="", description="Medium API key")
+    medium_author_id: str = Field(default="", description="Medium author ID")
+    did_api_key: str = Field(default="", description="D-ID API Key")
+
+    discord_bot_token: str = Field(default="", description="Discord bot token")
+
+    smtp_server: str = Field(default="", description="SMTP server IP")
+    smtp_port: str = Field(default="", description="SMTP server port")
+    smtp_username: str = Field(default="", description="SMTP username")
+    smtp_password: str = Field(default="", description="SMTP password")
+
+    sentry_dsn: str = Field(default="", description="Sentry DSN")
+
     # Add more secret fields as needed
 
     model_config = SettingsConfigDict(
@@ -84,7 +135,7 @@ class Settings(BaseModel):
 
     def save(self) -> None:
         # Save updated config to JSON file
-        if self.config._updated_fields:
+        if self.config.updated_fields:
             config_to_save = self.config.get_updates()
             config_path = os.path.join(get_data_path(), "config.json")
             if os.path.exists(config_path):
@@ -101,7 +152,7 @@ class Settings(BaseModel):
 
         # Save updated secrets to individual files
         secrets_dir = get_secrets_path()
-        for key in self.secrets._updated_fields:
+        for key in self.secrets.updated_fields:
             secret_file = os.path.join(secrets_dir, key)
             with open(secret_file, "w") as f:
                 f.write(str(getattr(self.secrets, key)))
